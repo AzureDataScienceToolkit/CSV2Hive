@@ -1,154 +1,139 @@
-import sys
-import urllib2
-import csv
-import datetime
-import time
+import argparse, itertools, csv
 
-def validateYYMMDD(date_text):
-    try:
-        datetime.datetime.strptime(date_text, '%Y-%m-%d')
-	return 1
-    except ValueError:
-	return 0
+class RemoteCSVFileReader:
+    def __init__(self, filepath, samplesize, noheader, colprefix=None, row_preprocessor=None):
+        self.sample_size = samplesize
+        self.sample_rows = []
+        self.header_row = []
+        self._noheader = noheader
+        self.col_prefix = colprefix
+        if self._noheader and self.col_prefix is None:
+            self.col_prefix = "c"
+        if row_preprocessor is not None:
+            self._preprocess = row_preprocessor
 
-def validateDDMMYY(date_text):
-    try:
-        datetime.datetime.strptime(date_text, '%d/%m/%y')
-	return 1
-    except ValueError:
-	return 0
+        if filepath.startswith("wasb:"): #WASB connection
+            pass # TBD
+        elif filepath.startswith("http"): #http URI connection
+            pass # TBD
+        elif filepath.startswith("hdfs"): #HDFS connection
+            pass #TBD
+        else: #local file
+            self._parse_local_file(filepath)
+        self.column_map = ColumnTypeSniffer(self).column_map
 
-def validatefloat(text):
-    try:
-        float(text)
-	return 1
-        return float
-    except ValueError:
-	return 0
+    def _parse_local_file(self, filepath):
+        raw_file = open(filepath)
+        if self._noheader is False:
+            raw_header = [self._preprocess(raw_file.next())]
+            self.header_row= csv.reader(iter(raw_header),delimiter=",").next()
+        
+        for line in range(self.sample_size):
+            row = [self._preprocess(raw_file.next())]
+            self.sample_rows.append(csv.reader(iter(row)).next())
+        if self.col_prefix:
+            self.header_row = [self.col_prefix+str(i) for i in range(len(self.sample_rows[0]))]
 
-def validateHHMM(date_text):
-    try:
-        time.strptime(date_text, '%H:%M')
-	return 1
-    except ValueError:
-	return 0
+    def _preprocess(self, line):
+        return line
 
-def coltype( arr, coln ):
- col_int = 1
- col_float = 1
- col_DT = 1
- col_DATE = 1
- col_DDMMYY = 1
- col_YYMMDD = 1
- col_HHMM = 1
- for n in arr :
-   ct = unicode(n[coln], 'utf-8')
-   if ct.isnumeric() == 0 :
- 	col_int = 0
-   if validatefloat(ct) == 0:
- 	col_float = 0
-   if validateDDMMYY(ct) == 0:
- 	col_DDMMYY = 0
-   if validateYYMMDD(ct) == 0:
- 	col_YYMMDD = 0
-   if validateHHMM(ct) == 0:
- 	col_HHMM = 0
+class ColumnTypeSniffer:
+    def __init__(self, remote_csv_file_reader):
+        self.csv_reader = remote_csv_file_reader
+        self.column_map = {}
+        self._map_columns()
+        self._parse_columns()
+
+    def _map_columns(self):
+        for colnum, colname in enumerate(self.csv_reader.header_row):
+            self.column_map[colname] = [c[colnum] for c in self.csv_reader.sample_rows]
+
+    def _parse_columns(self):
+        for column in self.column_map:
+            self.column_map[column] = self._sniff_column(self.column_map[column])
+
+    def _sniff_column(self, samples):
+        if self._validate_integer(samples):
+            return 'int'
+        elif self._validate_float(samples):
+            return 'float'
+        else:
+            return 'string'
+
+    def _validate_float(self, samples):
+        try:
+            [float(i) for i in samples]
+            return True
+        except:
+            return False
+
+    def _validate_integer(self, samples):
+        try:
+            [int(i) for i in samples]
+            return True
+        except:
+            return False
+
+class TableSchemaGenerator:
+    def __init__(self, table, csv_reader, csvserde=False, header=False):
+        self.hql_schema = []
+        self.hql_schema.append("CREATE EXTERNAL TABLE %s (" % args.table)
+        for column in csv_reader.header_row:
+            self.hql_schema.append("\t %s %s," % (column, csv_reader.column_map[column]))
+        #removing last comma
+        self.hql_schema[-1] = self.hql_schema[-1][:-1]+")"
+
+        if args.csvserde:
+            self.hql_schema.append("ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'")
+        else:
+            self.hql_schema.append("ROW FORMAT DELIMITED FIELDS TERMINATED BY ','")
+
+        self.hql_schema.append("STORED AS TEXTFILE LOCATION \"\"")
+
+        if not args.noheader: #skipping first row
+                self.hql_schema.append ('tblproperties (\"skip.header.line.count\"=\"1\")')
+
+        self.hql_schema[-1] = self.hql_schema[-1]+";"
+
+    def write(self, filename):
+        output = open(filename, "w")
+        output.write('\n'.join(self.hql_schema))
+        output.close()
+    
+    def dump(self):
+        print '\n'.join(self.hql_schema)
+
+def CustomRowPreprocessor(line):
+    return line
+
+#def CustomRowPreprocessor(line):
+#    """Custom row preprocessor example"""
+#    line = line.replace('"""', '""')
+#    line = line.replace('""','"')[1:]
+#    line = line.replace(';;','')
+#    return line
 
 
- RS = "string"
- if col_float == 1 :
-   RS = "float"
- if col_int == 1 :
-   RS = "int"
- if col_DDMMYY == 1 :
-   RS = "string"
+if __name__ ==  "__main__":
+    parser = argparse.ArgumentParser(description="Generates basic Hive table schema based on CSV file structure.")
+    parser.add_argument('table', type=str, help='name of Hive table')
+    parser.add_argument('file', type=str, help='location and name of CSV file')
+    parser.add_argument('--output', type=str, default=None, help="location and name of the output file")
+    parser.add_argument('--noheader', action="store_true", default=False, help='if noheader is true, columns will be named automatically using prefix')
+    parser.add_argument('--colprefix', type=str, default=None, help='Column prefix')
+    parser.add_argument('--csvserde', default=False, action="store_true", help="use CSVSerde instead of plain text file")
+    parser.add_argument('--sample', type=int, default=10, help='number of rows to be sampled (default=10)')
+    args = parser.parse_args()
 
- if col_YYMMDD == 1 :
-   RS = "string"
-
- if col_HHMM == 1 :
-   RS = "string"
-
- return RS
-
-if __name__ == "__main__":
-    if len(sys.argv) != 4:
-        print("Usage: GenHiveCreate Table STORAGEURL HEAD/NOHEAD SAMPLESIZE")
-        exit(-1)
-
-    HEAD = 0
-    n = 10
-    file_name = sys.argv[1]
-    if sys.argv[2] == "HEAD" :
-       HEAD = 1
-    n = int(sys.argv[3])
-    nlines = 0
+    csv_structure = RemoteCSVFileReader(args.file, args.sample, args.noheader, colprefix=args.colprefix, row_preprocessor=CustomRowPreprocessor)
+    schema_gen = TableSchemaGenerator(args.table, csv_structure, args.csvserde, args.noheader)
+    if args.output:
+        schema_gen.write(args.output)
+    else:
+        schema_gen.dump()
 
 
-    url = sys.argv[1]
-    data = urllib2.urlopen(url)
-    cr = csv.reader(data)
-    HEADS = []
-    MAXC = 0
-    MINC = 9999999
-    HC = 0
-    result = []
-    WASBI = url.split('/');
-    WASB = "wasb://{}@{}/".format(WASBI[3],WASBI[2])
-    #for WI in range(4, len(WASBI)):
-    #   WASB = "{}/{}".format(WASB,WASBI[WI])
-    TN = WASBI[len(WASBI) -1]
-    TNA = TN.split('.')
-    TN = TNA[0]
 
 
-    for row in cr:
-       if HEAD == 1 and nlines == 0:
-         for i in row:
-            HEADS.append(i)
-            HC += 1
-       else :
-         result.append(row)
-	 if len(row) > MAXC :
-	  MAXC=len(row)
-	 if len(row) < MINC :
-	  MINC=len(row)
 
-       nlines += 1
-       if nlines >= n:
-            break
 
-    if nlines > 1 :
-       if HEAD == 1:
-         if MAXC > HC :
-           print "WARNING: Some Row columns > Header columns"
-         if MINC != HC :
-           print "WARNING: Some Row columns are < Header columns"
-
-       print "DROP TABLE {};".format(TN)
-       print "CREATE EXTERNAL TABLE {}".format(TN)
-       print "("
-       if HEAD == 1 :
-         cn = 0
-         for HX in HEADS :
-		cn = cn+1
-		cs = coltype(result,cn-1)
-                if cn < len(HEADS):
-		  print "{} {} ,".format(HX,cs)
-		else :
-		  print "{} {}".format(HX,cs)
-       else :
-         for HI in range(1, MAXC):
-		cs = coltype(result,HI-1)
-                if HI < MAXC:
-		  print "COL{} {},".format(HI,cs)
-		else:
-		  print "COL{} {}".format(HI,cs)
-
-       print ")"
-       print "COMMENT \"{}\"".format(url)
-       print "ROW FORMAT   DELIMITED"
-       print "FIELDS TERMINATED BY ','"
-       print "STORED AS TEXTFILE LOCATION '{}'".format(WASB)
-       if HEAD == 1:
-         print "tblproperties (\"skip.header.line.count\"=\"1\"); "
